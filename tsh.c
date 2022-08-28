@@ -80,11 +80,30 @@ int pid2jid(pid_t pid);
 void listjobs(struct job_t *jobs);
 
 void usage(void);
-void unix_error(char *msg);
+void sio_error(char *msg);
 void app_error(char *msg);
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
+/* signal-safe I/O functions ported from csapp.c */
+static size_t sio_strlen(char s[])
+{
+    int i = 0;
 
+    while (s[i] != '\0')
+        ++i;
+    return i;
+}
+
+ssize_t sio_puts(char s[]) /* Put string */
+{
+    return write(STDOUT_FILENO, s, sio_strlen(s)); //line:csapp:siostrlen
+}
+
+void sio_error(char s[]) /* Put error message and exit */
+{
+    sio_puts(s);
+    _exit(1);                                      //line:csapp:sioexit
+}
 /*
  * main - The shell's main routine 
  */
@@ -165,6 +184,46 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
+    char * argv[MAXARGS]; 
+    char buf[MAXLINE]; 
+    int bg;              /* Should the job run in bg or fg */
+    pid_t pid;           /* Process id */
+    int status;
+    sigset_t mask;
+
+    sigemptyset(&mask);
+
+    strcpy(buf, cmdline);
+    bg = parseline(buf, argv);
+
+    if (argv[0] == NULL)
+        return;  /* Ignore empty lines */
+
+    if(!builtin_cmd(argv))
+    {
+        sigaddset(&mask, SIGCHLD);
+        sigprocmask(SIG_BLOCK, &mask , NULL); /*block SIGCHLD */
+        if ((pid = fork()) == 0) {  /* Child runs user job */
+            sigprocmask(SIG_UNBLOCK, &mask, NULL);
+            setpgid(0,0); // PUTS THE CHILD IN A NEW PROCESS GROUP, GID = PID
+            if (execve(argv[0], argv, environ) < 0) {
+                printf("%s: Command not found.\n", argv[0]);
+                _exit(1);
+            }
+        }
+        // adds the child to job list
+        addjob(jobs, pid, (bg?BG:FG) , cmdline);
+        sigprocmask(SIG_UNBLOCK,&mask, NULL); // unblock SIGCHLD
+        
+        /* Parent waits for foreground job to terminate */
+        if (!bg) {
+           waitfg(pid);
+                
+        }
+        else
+            printf("%d %d %s", pid2jid(pid), pid, cmdline);
+    
+    }
     return;
 }
 
@@ -231,6 +290,19 @@ int parseline(const char *cmdline, char **argv)
  */
 int builtin_cmd(char **argv) 
 {
+    if (!strcmp(argv[0], "quit")) {  /* quit command */
+        exit(0);
+    }
+    if(!strcmp(argv[0], "jobs"))
+    {
+        listjobs(jobs);
+        return 1;
+    }
+    if(!strcmp(argv[0], "bg") || !strcmp(argv[0], "fg")){
+        do_bgfg(argv);
+        return 1;
+    }
+
     return 0;     /* not a builtin command */
 }
 
@@ -239,6 +311,55 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
+    char *id = argv[1];
+    struct job_t * job;
+    int i;
+    int length;
+
+    if(id== NULL){
+        printf("%s command requires PID or %% jobid argument\n", argv[0]);
+        return;
+    }
+    if(id[0] == '%'){
+        id++; 
+        length = strlen(id);
+        for(i =0; i < length; i++)
+        {
+            if(!isdigit(id[i])){
+                printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+                return;
+            }
+        }
+        job = getjobjid(jobs, atoi(id));
+        if(job == NULL){
+            printf("%%%d: No such job\n", atoi(id));
+            return;
+        }
+    }
+    else {
+        length = strlen(id);
+        for(i =0; i< length ; i++){
+            if(!isdigit(id[i])){
+                printf("%s: argument must be a PID or %% jobid \n", argv[0]);
+                return;
+            }
+        }
+        job = getjobpid(jobs, atoi(id));
+        if(job == NULL){
+            printf("(%d): No such processes\n", atoi(id));
+            return;
+        }
+    }
+    kill(-(job->pid),SIGCONT);
+    if(!strcmp(argv[0], "fg")){
+        job->state =FG;
+        waitfg(job->pid);
+    }
+    else{
+        job->state =BG;
+        printf("[%d] (%d) %s" , job->jid, job->pid, job->cmdline);
+    }
+
     return;
 }
 
@@ -247,6 +368,11 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+    while (pid == fgpid(jobs))
+    {
+        sleep(0);
+    }
+    
     return;
 }
 
@@ -263,6 +389,27 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+    pid_t pid; 
+    int status;
+    while((pid = waitpid(-1, &status, WNOHANG|WUNTRACED)) >0){
+        if(WIFEXITED(status))
+        {
+            deletejob(jobs,pid);
+        }
+        if(WIFSIGNALED(status)){
+            printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, WTERMSIG(status));
+            deletejob(jobs,pid);
+        }
+        if(WIFSTOPPED(status)){
+            printf("Job [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, WSTOPSIG(status));
+            struct job_t * job = getjobpid(jobs, pid);
+            job->state = ST;
+        }
+    }
+    if(pid< 0 && errno != ECHILD)
+    {
+        sio_error("waitpid error");
+    }
     return;
 }
 
@@ -273,6 +420,12 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+    pid_t pid = fgpid(jobs);
+    if(pid != 0){
+        if(kill(-pid, SIGINT) < 0){
+            sio_error("sigint error");
+        }
+    }
     return;
 }
 
@@ -283,6 +436,13 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    pid_t pid = fgpid(jobs);
+    if(pid!= 0)
+    {
+        if(kill(-pid, SIGTSTP)< 0){
+            sio_error("sigint error");
+        }
+    }
     return;
 }
 
@@ -462,13 +622,13 @@ void usage(void)
 }
 
 /*
- * unix_error - unix-style error routine
+ * sio_error - unix-style error routine
  */
-void unix_error(char *msg)
-{
-    fprintf(stdout, "%s: %s\n", msg, strerror(errno));
-    exit(1);
-}
+// void sio_error(char *msg)
+// {
+//     fprintf(stdout, "%s: %s\n", msg, strerror(errno));
+//     exit(1);
+// }
 
 /*
  * app_error - application-style error routine
@@ -491,7 +651,7 @@ handler_t *Signal(int signum, handler_t *handler)
     action.sa_flags = SA_RESTART; /* restart syscalls if possible */
 
     if (sigaction(signum, &action, &old_action) < 0)
-	unix_error("Signal error");
+	sio_error("Signal error");
     return (old_action.sa_handler);
 }
 
